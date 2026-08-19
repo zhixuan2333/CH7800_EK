@@ -60,7 +60,7 @@
           "hatch_smoothing_level": 0,
           "hatch_smoothing_value": 0.1,
           "hatch_thickness": 1.0,
-          "min_clearance": 0.5,
+          "min_clearance": 0.0,
           "min_island_area": 10.0,
           "min_thickness": 0.25,
           "pad_connection": 1,
@@ -99,6 +99,22 @@
           ""
         ],
         [
+          "items_not_allowed|154502000|122500000|3aaa8659-4ce5-4f5f-8cab-447c2c008226|00000000-0000-0000-0000-000000000000",
+          ""
+        ],
+        [
+          "items_not_allowed|154707324|86267592|b3ac3c0f-6151-4fc4-9edc-305944717176|00000000-0000-0000-0000-000000000000",
+          ""
+        ],
+        [
+          "items_not_allowed|96550022|120512339|0bd6fe4f-4d7e-4fbe-86b4-4e3d7e82a2ab|00000000-0000-0000-0000-000000000000",
+          ""
+        ],
+        [
+          "items_not_allowed|97999999|90997999|50c3261a-9b60-4573-be95-ac514b8b1883|00000000-0000-0000-0000-000000000000",
+          ""
+        ],
+        [
           "silk_edge_clearance|96000000|100030000|89546264-41f2-419d-a319-04736b8c5b85|9c99b914-17c3-4112-be0f-fc83f6094a42",
           ""
         ],
@@ -116,18 +132,6 @@
         ],
         [
           "silk_overlap|110500000|99000000|cffd27e3-10f1-4755-b6d2-52ccbbb88480|de79265e-1ee9-4e08-aed0-bb2054a91c4e",
-          ""
-        ],
-        [
-          "silk_overlap|134731242|96430582|89a39487-201a-47a7-bf74-df7fa4fd0868|bf2163fe-b819-4649-be1f-1e8f8c488d65",
-          ""
-        ],
-        [
-          "starved_thermal|100725879|108820000|2471535d-20c4-4878-a028-a3a47834d262|82c3d485-6c19-4e3c-9a7d-ad009a318662|B.Cu",
-          ""
-        ],
-        [
-          "starved_thermal|97760000|109520000|2471535d-20c4-4878-a028-a3a47834d262|305e7ffa-37d1-4239-9e35-912c741b0e62|B.Cu",
           ""
         ]
       ],
@@ -216,7 +220,7 @@
         "min_track_width": 0.2,
         "min_via_annular_width": 0.1,
         "min_via_diameter": 0.5,
-        "solder_mask_to_copper_clearance": 0.0,
+        "solder_mask_to_copper_clearance": 0.005,
         "use_height_for_length_calcs": true
       },
       "teardrop_options": [
@@ -310,7 +314,7 @@
       "internal_id": "",
       "mfg": "",
       "mpn": "",
-      "sch_revision": "v1.0"
+      "sch_revision": "v1.1"
     },
     "layer_pairs": [],
     "layer_presets": [],

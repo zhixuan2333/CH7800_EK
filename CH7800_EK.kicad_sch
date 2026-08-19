@@ -6,8 +6,8 @@
 	(paper "A4")
 	(title_block
 		(title "CH7800_EK")
-		(date "2026-08-09")
-		(rev "v1.0")
+		(date "2026-08-19")
+		(rev "v1.1")
 	)
 	(lib_symbols
 		(symbol "CH7800:CH7800"
