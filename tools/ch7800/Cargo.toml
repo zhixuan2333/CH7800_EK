@@ -1,0 +1,13 @@
+[package]
+name = "ch7800"
+version = "0.1.0"
+edition = "2021"
+description = "CH7800 UART terminal controller"
+
+[dependencies]
+anyhow = "1"
+ch7800-protocol = { path = "../ch7800-protocol" }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+serialport = "4"
