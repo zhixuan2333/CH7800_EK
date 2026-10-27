@@ -1,0 +1,14 @@
+[package]
+name = "ch32v003-play"
+version = "0.1.0"
+edition = "2021"
+description = "CH32V003 firmware: play a CH7800 track over USART1"
+
+[dependencies]
+ch7800-protocol = { path = "../ch7800-protocol" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
