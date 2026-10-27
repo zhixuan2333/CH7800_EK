@@ -23,8 +23,8 @@ use ch7800_protocol::{Command, Controller, Response, UartTx};
 use core::ptr::{read_volatile, write_volatile};
 
 const HCLK: u32 = 24_000_000;
-const VOLUME: u8 = 20; // 0..=30. VCC fed from USB 5V; 7 was for the back-fed 3V3 rail.
-const TRACKS: u32 = 4; // Random pick from 1..=TRACKS.
+const VOLUME: u8 = 30; // 0..=30 (max). VCC fed from USB 5V; 7 was for the back-fed 3V3 rail.
+const TRACKS: u32 = 3; // Random pick from 1..=TRACKS (at most 4: see `track_counts`).
 const MAX_ATTEMPTS: u8 = 3;
 const BUSY_TIMEOUT_MS: u32 = 1500;
 /// Stay awake this long after reset so a debugger can attach before the first standby.
@@ -185,7 +185,7 @@ struct Debug {
     busy_start_ms: u16,
     /// How long BUSY stayed away from idle (ms): roughly the audible play time.
     busy_len_ms: u16,
-    /// How often each track 1..=4 was picked.
+    /// How often each track 1..=TRACKS was picked.
     track_counts: [u8; 4],
 }
 
