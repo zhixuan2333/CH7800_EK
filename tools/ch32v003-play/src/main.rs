@@ -1,39 +1,74 @@
 #![no_std]
 #![no_main]
 
-//! CH32V003 -> CH7800: wait for the player to boot, play a track, and use the
-//! CH7800 BUSY pin to confirm that audio actually started (ACK alone does not).
+//! CH32V003 -> CH7800 motion-triggered player. The MCU sleeps in standby until the
+//! SB612B PIR output (TEST pin: 3.3 V while motion is detected) raises PD7, then
+//! plays a random track 1..=TRACKS and goes back to standby. One play per rising
+//! edge: while the PIR stays high (repeatable trigger), nothing replays.
 //! USART1 on PD5 (TX) / PD6 (RX), 9600 8N1. PA1 reads the CH7800 BUSY pin (J3-6).
 //!
 //! BUSY polarity is not documented in the material we have, so the firmware
-//! samples the idle level after boot and treats any stable change as "playing".
-//! Observed on the EK: idle high, low ~30 ms after Track while audio plays.
+//! samples the idle level after waking the chip and treats any stable change as
+//! "playing". Observed on the EK: idle high, low ~30 ms after Track while audio plays.
 //! If BUSY does not move, it asks the chip (0x42) as a second opinion and
-//! retries the wake/volume/track sequence a few times. Before playing, it runs a
+//! retries the wake/volume/track sequence a few times. At boot it runs a
 //! UART self-test (version, file count, volume) so link problems show up on their own.
+//!
+//! PD7 is NRST from the factory. On first boot the firmware rewrites the USER
+//! option byte so PD7 is a plain GPIO, then resets once.
+//! The debugger cannot attach in standby: flash within BOOT_AWAKE_MS of power-up
+//! or while a track is playing.
 
 use ch7800_protocol::{Command, Controller, Response, UartTx};
 use core::ptr::{read_volatile, write_volatile};
 
 const HCLK: u32 = 24_000_000;
 const VOLUME: u8 = 30; // 0..=30 (max). VCC fed from USB 5V; 7 was for the back-fed 3V3 rail.
-const TRACK: u16 = 2; // Track 1 browns out the shared 3V3 rail; track 2 plays.
+const TRACKS: u32 = 4; // Random pick from 1..=TRACKS.
 const MAX_ATTEMPTS: u8 = 3;
 const BUSY_TIMEOUT_MS: u32 = 1500;
+/// Stay awake this long after reset so a debugger can attach before the first standby.
+const BOOT_AWAKE_MS: u32 = 5000;
+/// Give up waiting for a track to end after this long (10 min).
+const MAX_PLAY_MS: u32 = 600_000;
 
 const FLASH_ACTLR: usize = 0x4002_2000;
+const FLASH_KEYR: usize = 0x4002_2004;
+const FLASH_OBKEYR: usize = 0x4002_2008;
+const FLASH_STATR: usize = 0x4002_200c;
+const FLASH_CTLR: usize = 0x4002_2010;
+const FLASH_KEY1: u32 = 0x4567_0123;
+const FLASH_KEY2: u32 = 0xcdef_89ab;
+/// Option bytes: RDPR, USER, DATA0, DATA1, WRPR0..3 (each value + complement).
+const OB_BASE: usize = 0x1fff_f800;
+const ESIG_UNIID1: usize = 0x1fff_f7e8;
 const RCC_CFGR0: usize = 0x4002_1004;
 const RCC_APB2PCENR: usize = 0x4002_1018;
+const RCC_APB1PCENR: usize = 0x4002_101c;
 const RCC_RSTSCKR: usize = 0x4002_1024;
+const PWR_CTLR: usize = 0x4000_7000;
+const AFIO_EXTICR: usize = 0x4001_0008;
+const EXTI_EVENR: usize = 0x4001_0404;
+const EXTI_RTENR: usize = 0x4001_0408;
+const EXTI_INTFR: usize = 0x4001_0414;
 const GPIOA_CFGLR: usize = 0x4001_0800;
 const GPIOA_INDR: usize = 0x4001_0808;
+const GPIOA_OUTDR: usize = 0x4001_080c;
+const GPIOC_CFGLR: usize = 0x4001_1000;
+const GPIOC_OUTDR: usize = 0x4001_100c;
 const GPIOD_CFGLR: usize = 0x4001_1400;
+const GPIOD_OUTDR: usize = 0x4001_140c;
 const USART1_STATR: usize = 0x4001_3800;
 const USART1_DATAR: usize = 0x4001_3804;
 const USART1_BRR: usize = 0x4001_3808;
 const USART1_CTLR1: usize = 0x4001_380c;
+const PFIC_CFGR: usize = 0xe000_e048;
+const PFIC_SCTLR: usize = 0xe000_ed10;
 const STK_CTLR: usize = 0xe000_f000;
 const STK_CNT: usize = 0xe000_f008;
+
+/// PD7 trigger input (SB612B TEST pin).
+const TRIGGER_PIN: u32 = 7;
 
 #[cfg(target_arch = "riscv32")]
 core::arch::global_asm!(
@@ -76,11 +111,13 @@ mod stage {
     pub const PLAYING_BUSY_STUCK: u8 = 7;
     /// Track finished (BUSY back to idle or completion frame).
     pub const FINISHED: u8 = 8;
+    /// In standby, waiting for PD7. Only visible if a debugger catches it on the way in.
+    pub const STANDBY: u8 = 0x0a;
     /// All attempts failed: neither BUSY nor 0x42 says it is playing.
     pub const FAILED: u8 = 0xee;
 }
 
-/// Inspectable over SWD (e.g. `wlink`/`minichlink` memory read of `DEBUG`).
+/// Inspectable over SWD (e.g. `probe-rs read b8 0x20000000 32`).
 #[no_mangle]
 static mut DEBUG: Debug = Debug {
     stage: 0,
@@ -100,8 +137,13 @@ static mut DEBUG: Debug = Debug {
     file_count: [0xff; 2],
     volume_read: 0xff,
     busy_edges: 0,
+    wakes: 0,
+    plays: 0,
+    last_track: 0,
+    option_user: 0,
     busy_start_ms: 0xffff,
     busy_len_ms: 0,
+    track_counts: [0; 4],
 };
 
 #[repr(C)]
@@ -115,7 +157,7 @@ struct Debug {
     last_data: [u8; 2],
     /// Current BUSY level (PA1).
     busy: u8,
-    /// BUSY level sampled after boot, before any play command.
+    /// BUSY level sampled after the wake request, before the Track command.
     busy_idle: u8,
     attempts: u8,
     /// Last 0x42 answer: 0 stopped, 1 playing, 2 paused, 0xFF never answered.
@@ -132,10 +174,19 @@ struct Debug {
     volume_read: u8,
     /// BUSY level changes seen after the last Track command.
     busy_edges: u8,
+    /// Standby wake-ups by PD7.
+    wakes: u8,
+    /// Tracks started (any result).
+    plays: u8,
+    last_track: u8,
+    /// USER option byte at boot; bits 4:3 = 11 means PD7 is GPIO.
+    option_user: u8,
     /// ms from the Track command to the first BUSY change (0xFFFF = never).
     busy_start_ms: u16,
     /// How long BUSY stayed away from idle (ms): roughly the audible play time.
     busy_len_ms: u16,
+    /// How often each track 1..=4 was picked.
+    track_counts: [u8; 4],
 }
 
 fn debug() -> &'static mut Debug {
@@ -156,6 +207,28 @@ fn now() -> u32 {
 
 fn busy_raw() -> u8 {
     (reg_read(GPIOA_INDR) >> 1 & 1) as u8
+}
+
+/// xorshift32 state. Stirred with SysTick whenever a UART byte arrives: the CH7800
+/// runs on its own clock, so the arrival phase against HSI is jitter, not a constant.
+static mut RNG: u32 = 0;
+
+fn stir(x: u32) {
+    let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) };
+    *rng = rng.rotate_left(7) ^ x;
+}
+
+fn random_track() -> u16 {
+    let rng = unsafe { &mut *core::ptr::addr_of_mut!(RNG) };
+    let mut x = *rng ^ now();
+    if x == 0 {
+        x = 0x6d2b_79f5;
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *rng = x;
+    (x % TRACKS) as u16 + 1
 }
 
 struct Usart1;
@@ -262,6 +335,7 @@ fn pump(chip: &mut Controller<Usart1>, ms: u32, until: impl Fn(&Response) -> boo
             let _ = reg_read(USART1_DATAR); // ORE: clear by reading DATAR
         }
         if status & (1 << 5) != 0 {
+            stir(now());
             if let Some(response) = chip.receive(reg_read(USART1_DATAR) as u8) {
                 record(&response);
                 if until(&response) {
@@ -294,6 +368,25 @@ fn wait_busy_change(chip: &mut Controller<Usart1>, idle: u8, timeout_ms: u32) ->
     false
 }
 
+/// Wait for the end of the track: a completion frame, or (if `use_busy`) BUSY back
+/// at `idle` for 50 ms. Gives up after MAX_PLAY_MS.
+fn wait_done(chip: &mut Controller<Usart1>, idle: u8, use_busy: bool) {
+    let finished_at_start = debug().finished;
+    let mut idle_ms = 0;
+    for _ in 0..MAX_PLAY_MS / 10 {
+        pump(chip, 10, |_| false);
+        if debug().finished != finished_at_start {
+            return;
+        }
+        if use_busy {
+            idle_ms = if busy_raw() == idle { idle_ms + 10 } else { 0 };
+            if idle_ms >= 50 {
+                return;
+            }
+        }
+    }
+}
+
 fn send(chip: &mut Controller<Usart1>, command: &Command<'_>) {
     let _ = chip.send(command);
     // >=20 ms between frames (>=50 ms after a wake request); also collects the ACK.
@@ -314,32 +407,164 @@ fn query_state(chip: &mut Controller<Usart1>) -> Option<u8> {
     query(chip, &Command::Status).then(|| debug().play_state)
 }
 
+/// Wake the CH7800, play `track`, confirm it started, and wait for it to end.
+/// Returns the final stage.
+fn play(chip: &mut Controller<Usart1>, track: u16) -> u8 {
+    {
+        let debug = debug();
+        debug.plays = debug.plays.wrapping_add(1);
+        debug.last_track = track as u8;
+        let slot = &mut debug.track_counts[usize::from(track - 1) & 3];
+        *slot = slot.wrapping_add(1);
+    }
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        debug().attempts = attempt;
+
+        set_stage(stage::WAKE);
+        send(chip, &Command::Status); // disposable wake-up request
+        // Idle BUSY level, after the wake-up and before anything has been asked to play.
+        let idle = busy_raw();
+        debug().busy_idle = idle;
+        set_stage(stage::VOLUME);
+        send(chip, &Command::Volume { level: VOLUME, remember: false });
+        set_stage(stage::TRACK);
+        let _ = chip.send(&Command::Track(track));
+        arm_busy_watch(idle);
+
+        set_stage(stage::WAIT_BUSY);
+        if wait_busy_change(chip, idle, BUSY_TIMEOUT_MS) {
+            set_stage(stage::PLAYING);
+            wait_done(chip, idle, true);
+            return stage::FINISHED;
+        }
+        // BUSY did not move. Ask the chip directly.
+        if query_state(chip) == Some(1) {
+            set_stage(stage::PLAYING_BUSY_STUCK);
+            wait_done(chip, idle, false);
+            return stage::PLAYING_BUSY_STUCK;
+        }
+        // Not playing: let the rail recover, then retry the whole sequence.
+        pump(chip, 500, |_| false);
+    }
+    stage::FAILED
+}
+
+fn flash_wait() {
+    while reg_read(FLASH_STATR) & 1 != 0 {} // BSY
+}
+
+fn ob_read(index: usize) -> u8 {
+    unsafe { read_volatile((OB_BASE + 2 * index) as *const u16) as u8 }
+}
+
+/// Make PD7 a GPIO (USER.RST_MODE = 11) instead of NRST. Rewrites the option
+/// bytes (keeping RDPR unprotected and the other bytes as they were) and resets
+/// so they load. Does nothing once the stored value is already right.
+fn ensure_pd7_gpio() {
+    let user = ob_read(1);
+    debug().option_user = user;
+    if user & 0x18 == 0x18 {
+        return;
+    }
+    let mut bytes = [0u8; 8];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = ob_read(i);
+    }
+    bytes[0] = 0xa5; // RDPR: no read protection
+    bytes[1] = user | 0x18;
+
+    reg_write(FLASH_KEYR, FLASH_KEY1);
+    reg_write(FLASH_KEYR, FLASH_KEY2);
+    reg_write(FLASH_OBKEYR, FLASH_KEY1);
+    reg_write(FLASH_OBKEYR, FLASH_KEY2);
+    flash_wait();
+    reg_write(FLASH_CTLR, reg_read(FLASH_CTLR) | 1 << 5); // OBER
+    reg_write(FLASH_CTLR, reg_read(FLASH_CTLR) | 1 << 6); // STRT
+    flash_wait();
+    reg_write(FLASH_CTLR, reg_read(FLASH_CTLR) & !(1 << 5) | 1 << 4); // OBPG
+    for (i, &b) in bytes.iter().enumerate() {
+        // The complement byte is generated by hardware.
+        unsafe { write_volatile((OB_BASE + 2 * i) as *mut u16, u16::from(b)) };
+        flash_wait();
+    }
+    reg_write(FLASH_CTLR, reg_read(FLASH_CTLR) & !(1 << 4) | 1 << 7); // LOCK
+    reg_write(PFIC_CFGR, 0xbeef_0080); // system reset: option bytes load at reset
+    loop {}
+}
+
+/// HSI 24 MHz, HCLK undivided. Also needed after standby, which falls back to HSI.
+fn clock_init() {
+    // 24 MHz needs one flash wait state; set it before raising HCLK.
+    reg_write(FLASH_ACTLR, reg_read(FLASH_ACTLR) & !0b11 | 0b01);
+    // SYSCLK = HSI 24 MHz, HCLK undivided (reset default divides by 3).
+    reg_write(RCC_CFGR0, 0);
+}
+
+fn gpio_init() {
+    // Clocks: AFIO, GPIOA, GPIOC, GPIOD, USART1; PWR for standby.
+    reg_write(
+        RCC_APB2PCENR,
+        reg_read(RCC_APB2PCENR) | 1 | 1 << 2 | 1 << 4 | 1 << 5 | 1 << 14,
+    );
+    reg_write(RCC_APB1PCENR, reg_read(RCC_APB1PCENR) | 1 << 28);
+    // Unused pins: input with pull-down (OUTDR = 0) so they do not float in standby.
+    // PA1 floating input (BUSY, driven by the CH7800), PA2 pull-down.
+    reg_write(GPIOA_CFGLR, reg_read(GPIOA_CFGLR) & !(0xff << 4) | 0x4 << 4 | 0x8 << 8);
+    reg_write(GPIOA_OUTDR, 0);
+    reg_write(GPIOC_CFGLR, 0x8888_8888);
+    reg_write(GPIOC_OUTDR, 0);
+    // PD1 is SWIO: leave it alone. PD0/PD2-4 pull-down, PD5 AF push-pull (TX),
+    // PD6 floating input (RX), PD7 pull-down input (PIR, idle low).
+    reg_write(
+        GPIOD_CFGLR,
+        reg_read(GPIOD_CFGLR) & 0xf0 | 0x8 | 0x888 << 8 | 0xb << 20 | 0x4 << 24 | 0x8 << 28,
+    );
+    reg_write(GPIOD_OUTDR, reg_read(GPIOD_OUTDR) & 1 << 1);
+    // EXTI7 <- PD7, rising edge, as a wake-up event (no interrupt handler needed).
+    reg_write(AFIO_EXTICR, reg_read(AFIO_EXTICR) & !(0b11 << 14) | 0b11 << 14);
+    reg_write(EXTI_RTENR, reg_read(EXTI_RTENR) | 1 << TRIGGER_PIN);
+    reg_write(EXTI_EVENR, reg_read(EXTI_EVENR) | 1 << TRIGGER_PIN);
+}
+
+fn wfi() {
+    #[cfg(target_arch = "riscv32")]
+    unsafe {
+        core::arch::asm!("wfi")
+    };
+}
+
+/// Enter standby until a PD7 rising edge. Edges seen before this call are dropped.
+fn standby() {
+    set_stage(stage::STANDBY);
+    reg_write(EXTI_INTFR, 1 << TRIGGER_PIN);
+    reg_write(PWR_CTLR, reg_read(PWR_CTLR) | 1 << 1); // PDDS: standby on deep sleep
+    reg_write(PFIC_SCTLR, reg_read(PFIC_SCTLR) | 1 << 2); // SLEEPDEEP
+    // WCH's __WFE: SETEVENT + WFI-as-WFE consumes any stale event, then sleep for real.
+    let sctlr = reg_read(PFIC_SCTLR);
+    reg_write(PFIC_SCTLR, sctlr | 1 << 3 | 1 << 5); // WFITOWFE, SETEVENT
+    reg_write(PFIC_SCTLR, reg_read(PFIC_SCTLR) & !(1 << 5) | sctlr & 1 << 5);
+    wfi();
+    reg_write(PFIC_SCTLR, reg_read(PFIC_SCTLR) | 1 << 3);
+    wfi();
+    clock_init();
+}
+
 #[no_mangle]
 extern "C" fn main() -> ! {
     // Reset cause, then clear the flags (RMVF) so the next reset is distinguishable.
     debug().reset_flags = (reg_read(RCC_RSTSCKR) >> 24) as u8;
     reg_write(RCC_RSTSCKR, reg_read(RCC_RSTSCKR) | 1 << 24);
 
-    // 24 MHz needs one flash wait state; set it before raising HCLK.
-    reg_write(FLASH_ACTLR, reg_read(FLASH_ACTLR) & !0b11 | 0b01);
-    // SYSCLK = HSI 24 MHz, HCLK undivided (reset default divides by 3).
-    reg_write(RCC_CFGR0, 0);
-    // Clocks: AFIO, GPIOA, GPIOD, USART1.
-    reg_write(
-        RCC_APB2PCENR,
-        reg_read(RCC_APB2PCENR) | 1 | 1 << 2 | 1 << 5 | 1 << 14,
-    );
-    // PA1 floating input (BUSY).
-    reg_write(GPIOA_CFGLR, reg_read(GPIOA_CFGLR) & !(0xf << 4) | 0x4 << 4);
-    // PD5 AF push-pull 50 MHz (TX), PD6 floating input (RX).
-    reg_write(
-        GPIOD_CFGLR,
-        reg_read(GPIOD_CFGLR) & !(0xff << 20) | 0xb << 20 | 0x4 << 24,
-    );
+    ensure_pd7_gpio();
+    clock_init();
+    gpio_init();
     reg_write(USART1_BRR, HCLK / 9600);
     reg_write(USART1_CTLR1, 1 << 13 | 1 << 3 | 1 << 2); // UE, TE, RE
     // SysTick free-running up-counter on HCLK.
     reg_write(STK_CTLR, 0b101);
+    let boot = now();
+    stir(reg_read(ESIG_UNIID1) ^ reg_read(ESIG_UNIID1 + 4) ^ reg_read(ESIG_UNIID1 + 8));
 
     let mut chip = Controller::new(Usart1);
 
@@ -349,10 +574,6 @@ extern "C" fn main() -> ! {
         pump(&mut chip, 200, |_| false);
     }
 
-    // Idle BUSY level, before anything has been asked to play.
-    let idle = busy_raw();
-    debug().busy_idle = idle;
-
     // UART round trip without starting audio: proves TX, RX and baud independently of power.
     set_stage(stage::UART_TEST);
     send(&mut chip, &Command::Status); // disposable wake-up request
@@ -360,42 +581,20 @@ extern "C" fn main() -> ! {
     query(&mut chip, &Command::FileCount);
     query(&mut chip, &Command::GetVolume);
 
-    let mut result = stage::FAILED;
-    for attempt in 1..=MAX_ATTEMPTS {
-        debug().attempts = attempt;
-
-        set_stage(stage::WAKE);
-        send(&mut chip, &Command::Status); // disposable wake-up request
-        set_stage(stage::VOLUME);
-        send(&mut chip, &Command::Volume { level: VOLUME, remember: false });
-        set_stage(stage::TRACK);
-        let _ = chip.send(&Command::Track(TRACK));
-        arm_busy_watch(idle);
-
-        set_stage(stage::WAIT_BUSY);
-        if wait_busy_change(&mut chip, idle, BUSY_TIMEOUT_MS) {
-            result = stage::PLAYING;
-            break;
-        }
-        // BUSY did not move. Ask the chip directly.
-        if query_state(&mut chip) == Some(1) {
-            result = stage::PLAYING_BUSY_STUCK;
-            break;
-        }
-        // Not playing: let the rail recover, then retry the whole sequence.
-        pump(&mut chip, 500, |_| false);
+    // Debugger window before the first standby.
+    while now().wrapping_sub(boot) < BOOT_AWAKE_MS * (HCLK / 1000) {
+        pump(&mut chip, 10, |_| false);
     }
-    set_stage(result);
 
-    let finished_at_start = debug().finished;
     loop {
-        pump(&mut chip, 50, |_| false);
-        if result == stage::PLAYING {
-            let done = debug().finished != finished_at_start || busy_raw() == idle;
-            if done {
-                set_stage(stage::FINISHED);
-            }
-        }
+        standby();
+        let debug = debug();
+        debug.wakes = debug.wakes.wrapping_add(1);
+        stir(now());
+        let result = play(&mut chip, random_track());
+        set_stage(result);
+        // Let the PIR output settle; a still-high output needs to fall and rise again.
+        pump(&mut chip, 100, |_| false);
     }
 }
 
