@@ -16,7 +16,7 @@ use ch7800_protocol::{Command, Controller, Response, UartTx};
 use core::ptr::{read_volatile, write_volatile};
 
 const HCLK: u32 = 24_000_000;
-const VOLUME: u8 = 7; // Conservative while the supply is marginal.
+const VOLUME: u8 = 30; // 0..=30 (max). VCC fed from USB 5V; 7 was for the back-fed 3V3 rail.
 const TRACK: u16 = 2; // Track 1 browns out the shared 3V3 rail; track 2 plays.
 const MAX_ATTEMPTS: u8 = 3;
 const BUSY_TIMEOUT_MS: u32 = 1500;
