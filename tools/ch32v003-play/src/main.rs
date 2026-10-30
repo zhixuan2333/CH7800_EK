@@ -25,7 +25,7 @@ use core::ptr::{read_volatile, write_volatile};
 
 const HCLK: u32 = 24_000_000;
 const VOLUME: u8 = 30; // 0..=30 (max). VCC fed from USB 5V; 7 was for the back-fed 3V3 rail.
-const TRACKS: u32 = 3; // Random pick from 1..=TRACKS (at most 4: see `track_counts`).
+const TRACKS: u32 = 6; // Random pick from 1..=TRACKS (at most 8: see `track_counts`).
 const MAX_ATTEMPTS: u8 = 3;
 const BUSY_TIMEOUT_MS: u32 = 1500;
 /// Stay awake this long after reset so a debugger can attach before the first standby.
@@ -153,7 +153,7 @@ static mut DEBUG: Debug = Debug {
     option_user: 0,
     busy_start_ms: 0xffff,
     busy_len_ms: 0,
-    track_counts: [0; 4],
+    track_counts: [0; 8],
     wake_pins: 0xff,
 };
 
@@ -197,7 +197,7 @@ struct Debug {
     /// How long BUSY stayed away from idle (ms): roughly the audible play time.
     busy_len_ms: u16,
     /// How often each track 1..=TRACKS was picked.
-    track_counts: [u8; 4],
+    track_counts: [u8; 8],
     /// `trigger_pins()` right after the last wake: shows which input woke it
     /// (a short button press may already be released by then).
     wake_pins: u8,
@@ -428,7 +428,7 @@ fn play(chip: &mut Controller<Usart1>, track: u16) -> u8 {
         let debug = debug();
         debug.plays = debug.plays.wrapping_add(1);
         debug.last_track = track as u8;
-        let slot = &mut debug.track_counts[usize::from(track - 1) & 3];
+        let slot = &mut debug.track_counts[usize::from(track - 1) & 7];
         *slot = slot.wrapping_add(1);
     }
 
