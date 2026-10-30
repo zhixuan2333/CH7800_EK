@@ -3,7 +3,7 @@
 
 //! CH32V003 -> CH7800 motion/button-triggered player. The MCU sleeps in standby until
 //! the SB612B PIR output (TEST pin: 3.3 V while motion is detected) raises PD7, or a
-//! button on PC5/PC6 (to GND) is pressed, then plays a random track 1..=TRACKS and
+//! button shorting PC5 to PC6 is pressed, then plays a random track 1..=TRACKS and
 //! goes back to standby. One play per edge: while the PIR stays high (repeatable
 //! trigger) or a button is held, nothing replays. Triggers during playback are ignored.
 //! USART1 on PD5 (TX) / PD6 (RX), 9600 8N1. PA1 reads the CH7800 BUSY pin (J3-6).
@@ -73,10 +73,12 @@ const STK_CNT: usize = 0xe000_f008;
 
 /// PD7 trigger input (SB612B TEST pin), rising edge.
 const TRIGGER_PIN: u32 = 7;
-/// PC5 / PC6 push buttons to GND (internal pull-up), falling edge on press.
-const BUTTON_PINS: u32 = 1 << 5 | 1 << 6;
+/// Push button wired across PC5 (+) and PC6 (-): PC6 is driven low, PC5 is a
+/// pull-up input, so pressing shorts PC5 low (falling edge).
+const BUTTON_SENSE: u32 = 5;
+const BUTTON_DRIVE: u32 = 6;
 /// EXTI lines that wake from standby (line n = pin n of the port picked in AFIO_EXTICR).
-const WAKE_LINES: u32 = 1 << TRIGGER_PIN | BUTTON_PINS;
+const WAKE_LINES: u32 = 1 << TRIGGER_PIN | 1 << BUTTON_SENSE;
 
 #[cfg(target_arch = "riscv32")]
 core::arch::global_asm!(
@@ -119,7 +121,7 @@ mod stage {
     pub const PLAYING_BUSY_STUCK: u8 = 7;
     /// Track finished (BUSY back to idle or completion frame).
     pub const FINISHED: u8 = 8;
-    /// In standby, waiting for PD7 / PC5 / PC6. Only visible if a debugger catches it on the way in.
+    /// In standby, waiting for PD7 / the PC5-PC6 button. Only visible if a debugger catches it on the way in.
     pub const STANDBY: u8 = 0x0a;
     /// All attempts failed: neither BUSY nor 0x42 says it is playing.
     pub const FAILED: u8 = 0xee;
@@ -183,7 +185,7 @@ struct Debug {
     volume_read: u8,
     /// BUSY level changes seen after the last Track command.
     busy_edges: u8,
-    /// Standby wake-ups by PD7, PC5 or PC6.
+    /// Standby wake-ups by PD7 or the PC5-PC6 button.
     wakes: u8,
     /// Tracks started (any result).
     plays: u8,
@@ -524,9 +526,10 @@ fn gpio_init() {
     // PA1 floating input (BUSY, driven by the CH7800), PA2 pull-down.
     reg_write(GPIOA_CFGLR, reg_read(GPIOA_CFGLR) & !(0xff << 4) | 0x4 << 4 | 0x8 << 8);
     reg_write(GPIOA_OUTDR, 0);
-    // Port C all pull inputs: PC5/PC6 pull-up (buttons, idle high), the rest pull-down.
-    reg_write(GPIOC_CFGLR, 0x8888_8888);
-    reg_write(GPIOC_OUTDR, BUTTON_PINS);
+    // Port C: PC6 push-pull output low (button "-"), PC5 pull-up input (button "+",
+    // idle high), the rest pull-down inputs. Current flows only while pressed.
+    reg_write(GPIOC_CFGLR, 0x8888_8888 & !(0xf << 4 * BUTTON_DRIVE) | 0x2 << 4 * BUTTON_DRIVE);
+    reg_write(GPIOC_OUTDR, 1 << BUTTON_SENSE);
     // PD1 is SWIO: leave it alone. PD0/PD2-4 pull-down, PD5 AF push-pull (TX),
     // PD6 floating input (RX), PD7 pull-down input (PIR, idle low).
     reg_write(
@@ -535,21 +538,23 @@ fn gpio_init() {
     );
     reg_write(GPIOD_OUTDR, reg_read(GPIOD_OUTDR) & 1 << 1);
     // Wake-up events (no interrupt handler needed): EXTI7 <- PD7 rising edge,
-    // EXTI5/6 <- PC5/PC6 falling edge. AFIO_EXTICR: 2 bits per line, 10 = PC, 11 = PD.
+    // EXTI5 <- PC5 falling edge. AFIO_EXTICR: 2 bits per line, 10 = PC, 11 = PD.
     reg_write(
         AFIO_EXTICR,
-        reg_read(AFIO_EXTICR) & !(0x3f << 10) | 0b10 << 10 | 0b10 << 12 | 0b11 << 14,
+        reg_read(AFIO_EXTICR) & !(0b11 << 2 * BUTTON_SENSE | 0b11 << 2 * TRIGGER_PIN)
+            | 0b10 << 2 * BUTTON_SENSE
+            | 0b11 << 2 * TRIGGER_PIN,
     );
     reg_write(EXTI_RTENR, reg_read(EXTI_RTENR) | 1 << TRIGGER_PIN);
-    reg_write(EXTI_FTENR, reg_read(EXTI_FTENR) | BUTTON_PINS);
+    reg_write(EXTI_FTENR, reg_read(EXTI_FTENR) | 1 << BUTTON_SENSE);
     reg_write(EXTI_EVENR, reg_read(EXTI_EVENR) | WAKE_LINES);
 }
 
-/// Wake-source pin levels: bit0 PC5, bit1 PC6 (0 = pressed), bit2 PD7 (1 = motion).
+/// Wake-source pin levels: bit0 PC5 (0 = button pressed), bit1 PD7 (1 = motion).
 fn trigger_pins() -> u8 {
-    let c = reg_read(GPIOC_INDR);
-    let d = reg_read(GPIOD_INDR);
-    (c >> 5 & 0b11 | (d >> TRIGGER_PIN & 1) << 2) as u8
+    let c = reg_read(GPIOC_INDR) >> BUTTON_SENSE & 1;
+    let d = reg_read(GPIOD_INDR) >> TRIGGER_PIN & 1;
+    (c | d << 1) as u8
 }
 
 fn wfi() {
@@ -559,7 +564,7 @@ fn wfi() {
     };
 }
 
-/// Enter standby until a PD7 rising edge or a PC5/PC6 press. Edges seen before
+/// Enter standby until a PD7 rising edge or a PC5-PC6 button press. Edges seen before
 /// this call (e.g. button bounce or presses during playback) are dropped.
 fn standby() {
     set_stage(stage::STANDBY);
