@@ -1,0 +1,10 @@
+# CH32V003 (QingKe V2A) is RV32EC: no M extension, so riscv32emc would emit
+# mul/div that trap (illegal instruction -> jump to 0 -> silent restart).
+[build]
+target = "riscv32e-unknown-none-elf"
+
+[unstable]
+build-std = ["core"]
+
+[target.riscv32e-unknown-none-elf]
+rustflags = ["-C", "target-feature=+c", "-C", "link-arg=-Tlink.x"]
